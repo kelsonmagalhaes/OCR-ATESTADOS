@@ -1,7 +1,8 @@
 "use client";
 
 /**
- * Converts each page of a PDF file into a PNG data URL using pdf.js.
+ * Converts each page of a PDF file into a JPEG data URL using pdf.js.
+ * Uses scale 1.5 (sufficient for Vision API, smaller payload than 2.0).
  * Runs entirely client-side (browser only).
  */
 export async function pdfToImages(
@@ -13,7 +14,6 @@ export async function pdfToImages(
 
   // Set the worker source — file copied to /public by postinstall script
   if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
-    // Try .mjs first, fall back to .js
     pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
   }
 
@@ -29,8 +29,8 @@ export async function pdfToImages(
 
     const page = await pdf.getPage(pageNum);
 
-    // Scale 2x for better OCR accuracy (~200 DPI on typical 96 DPI screen)
-    const viewport = page.getViewport({ scale: 2.0 });
+    // Scale 1.5x — good enough for Vision API, reduces payload vs 2.0
+    const viewport = page.getViewport({ scale: 1.5 });
 
     const canvas = document.createElement("canvas");
     canvas.width = viewport.width;
@@ -41,7 +41,8 @@ export async function pdfToImages(
 
     await page.render({ canvasContext: ctx, viewport }).promise;
 
-    images.push(canvas.toDataURL("image/png"));
+    // Use JPEG at quality 0.85 — smaller than PNG, Vision API handles it fine
+    images.push(canvas.toDataURL("image/jpeg", 0.85));
 
     // Cleanup
     page.cleanup();

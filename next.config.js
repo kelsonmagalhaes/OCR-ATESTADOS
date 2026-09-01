@@ -1,8 +1,8 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  // Keep heavy libs out of the server bundle (Next.js 14 syntax)
+  // Keep pdfjs-dist out of server bundle (it's browser-only)
   experimental: {
-    serverComponentsExternalPackages: ["tesseract.js", "pdfjs-dist"],
+    serverComponentsExternalPackages: ["pdfjs-dist"],
   },
 
   webpack: (config, { isServer }) => {

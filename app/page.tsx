@@ -1,13 +1,16 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import Header from "@/components/Header";
 import UploadZone from "@/components/UploadZone";
 import ProcessingQueue from "@/components/ProcessingQueue";
 import DataTable from "@/components/DataTable";
 import ExportButton from "@/components/ExportButton";
+import SettingsModal, { STORAGE_KEY } from "@/components/SettingsModal";
 import { MedicalRecord, FileQueueItem, RecordField } from "@/types";
 import { extractFields } from "@/lib/fieldExtractor";
+
+const BATCH_SIZE = 5; // pages processed in parallel per file
 
 function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
@@ -35,38 +38,77 @@ export default function Home() {
   const [records, setRecords] = useState<MedicalRecord[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [hasStarted, setHasStarted] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [apiKey, setApiKey] = useState<string>("");
+  const [estimatedTimeLeft, setEstimatedTimeLeft] = useState<string>("");
 
-  // -----------------------------------------------------------------------
-  // File handling
-  // -----------------------------------------------------------------------
+  // Track pages processed for ETA
+  const processingStartRef = useRef<number>(0);
+  const pagesProcessedRef = useRef<number>(0);
+  const totalPagesRef = useRef<number>(0);
 
-  const handleFiles = useCallback((files: File[]) => {
-    const newItems: FileQueueItem[] = files.map((file) => ({
-      id: generateId(),
-      file,
-      progress: 0,
-      status: "pending",
-    }));
-    setQueue((prev) => [...prev, ...newItems]);
+  // Load API key from localStorage on mount
+  useEffect(() => {
+    const stored = localStorage.getItem(STORAGE_KEY) || "";
+    setApiKey(stored);
+  }, []);
+
+  const handleSaveApiKey = useCallback((key: string) => {
+    setApiKey(key);
+    if (key) {
+      localStorage.setItem(STORAGE_KEY, key);
+    } else {
+      localStorage.removeItem(STORAGE_KEY);
+    }
   }, []);
 
   // -----------------------------------------------------------------------
-  // OCR processing
+  // File handling — auto-start processing when files are added
+  // -----------------------------------------------------------------------
+
+  const processAllRef = useRef<(() => Promise<void>) | null>(null);
+
+  const handleFiles = useCallback(
+    (files: File[]) => {
+      const newItems: FileQueueItem[] = files.map((file) => ({
+        id: generateId(),
+        file,
+        progress: 0,
+        status: "pending",
+      }));
+      setQueue((prev) => [...prev, ...newItems]);
+    },
+    []
+  );
+
+  // Auto-start when new files are added (via effect watching queue length)
+  const queueRef = useRef<FileQueueItem[]>([]);
+  queueRef.current = queue;
+
+  // -----------------------------------------------------------------------
+  // OCR processing with parallel page batches
   // -----------------------------------------------------------------------
 
   const processAll = useCallback(async () => {
-    const pending = queue.filter((q) => q.status === "pending");
+    const pending = queueRef.current.filter((q) => q.status === "pending");
     if (pending.length === 0 || isProcessing) return;
+
+    // Check API key
+    const key = localStorage.getItem(STORAGE_KEY) || "";
+    if (!key && !process.env.NEXT_PUBLIC_HAS_SERVER_KEY) {
+      setSettingsOpen(true);
+      return;
+    }
 
     setIsProcessing(true);
     setHasStarted(true);
+    processingStartRef.current = Date.now();
+    pagesProcessedRef.current = 0;
 
-    // Lazy-import libs to avoid SSR errors
     const { pdfToImages } = await import("@/lib/pdfToImages");
     const { recognizeImage } = await import("@/lib/ocrEngine");
 
     for (const item of pending) {
-      // Mark as processing
       setQueue((prev) =>
         prev.map((q) =>
           q.id === item.id ? { ...q, status: "processing", progress: 5 } : q
@@ -80,19 +122,16 @@ export default function Home() {
           item.file.type === "application/pdf" ||
           item.file.name.toLowerCase().endsWith(".pdf")
         ) {
-          // PDF → images
           images = await pdfToImages(item.file, (page, total) => {
-            const pdfProgress = Math.round((page / total) * 40); // 5–45%
+            const pdfProgress = Math.round((page / total) * 30);
             setQueue((prev) =>
               prev.map((q) =>
-                q.id === item.id
-                  ? { ...q, progress: 5 + pdfProgress }
-                  : q
+                q.id === item.id ? { ...q, progress: 5 + pdfProgress } : q
               )
             );
+            totalPagesRef.current = Math.max(totalPagesRef.current, total);
           });
         } else {
-          // Direct image
           const dataUrl = await new Promise<string>((resolve, reject) => {
             const reader = new FileReader();
             reader.onload = () => resolve(reader.result as string);
@@ -100,28 +139,61 @@ export default function Home() {
             reader.readAsDataURL(item.file);
           });
           images = [dataUrl];
+          totalPagesRef.current += 1;
         }
 
         setQueue((prev) =>
           prev.map((q) =>
-            q.id === item.id ? { ...q, progress: 50 } : q
+            q.id === item.id ? { ...q, progress: 35 } : q
           )
         );
 
-        // OCR all pages and concatenate
-        let fullText = "";
-        for (let i = 0; i < images.length; i++) {
-          const result = await recognizeImage(images[i], (p) => {
-            const ocrProgress = 50 + Math.round(((i + p / 100) / images.length) * 45);
-            setQueue((prev) =>
-              prev.map((q) =>
-                q.id === item.id ? { ...q, progress: Math.min(ocrProgress, 95) } : q
-              )
+        // Process pages in parallel batches
+        const pageTexts: string[] = new Array(images.length).fill("");
+
+        for (let batchStart = 0; batchStart < images.length; batchStart += BATCH_SIZE) {
+          const batchEnd = Math.min(batchStart + BATCH_SIZE, images.length);
+          const batch = images.slice(batchStart, batchEnd);
+
+          const batchResults = await Promise.all(
+            batch.map((img, batchIdx) =>
+              recognizeImage(img, key, (p) => {
+                const pageIdx = batchStart + batchIdx;
+                const baseProgress = 35 + Math.round(((pageIdx + p / 100) / images.length) * 60);
+                setQueue((prev) =>
+                  prev.map((q) =>
+                    q.id === item.id
+                      ? { ...q, progress: Math.min(baseProgress, 95) }
+                      : q
+                  )
+                );
+              })
+            )
+          );
+
+          for (let i = 0; i < batchResults.length; i++) {
+            pageTexts[batchStart + i] = batchResults[i].text;
+          }
+
+          pagesProcessedRef.current += batch.length;
+
+          // Update ETA
+          const elapsed = (Date.now() - processingStartRef.current) / 1000;
+          const pagesPerSec = pagesProcessedRef.current / elapsed;
+          const remaining = totalPagesRef.current - pagesProcessedRef.current;
+          if (pagesPerSec > 0 && remaining > 0) {
+            const secLeft = Math.ceil(remaining / pagesPerSec);
+            setEstimatedTimeLeft(
+              secLeft > 60
+                ? `~${Math.ceil(secLeft / 60)} min restantes`
+                : `~${secLeft}s restantes`
             );
-          });
-          fullText += result.text + "\n";
+          } else {
+            setEstimatedTimeLeft("");
+          }
         }
 
+        const fullText = pageTexts.join("\n");
         const record = extractFields(fullText, item.file.name);
 
         setRecords((prev) => [...prev, record]);
@@ -144,7 +216,19 @@ export default function Home() {
     }
 
     setIsProcessing(false);
-  }, [queue, isProcessing]);
+    setEstimatedTimeLeft("");
+  }, [isProcessing]);
+
+  // Store processAll in ref so auto-start effect can call it
+  processAllRef.current = processAll;
+
+  // Auto-start: trigger processing whenever new pending items are added
+  useEffect(() => {
+    const pending = queue.filter((q) => q.status === "pending");
+    if (pending.length > 0 && !isProcessing) {
+      processAllRef.current?.();
+    }
+  }, [queue.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // -----------------------------------------------------------------------
   // Table mutations
@@ -181,63 +265,67 @@ export default function Home() {
 
   return (
     <div className="min-h-screen flex flex-col">
-      <Header />
+      <Header
+        onOpenSettings={() => setSettingsOpen(true)}
+        hasApiKey={!!apiKey}
+      />
+
+      <SettingsModal
+        isOpen={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        onSave={handleSaveApiKey}
+        currentKey={apiKey}
+      />
 
       <main className="flex-1 max-w-screen-xl mx-auto w-full px-4 py-8 space-y-8">
+        {/* API key warning */}
+        {!apiKey && (
+          <div
+            className="flex items-center gap-3 bg-orange-50 border border-orange-200 rounded-lg px-4 py-3 text-sm text-orange-800 cursor-pointer hover:bg-orange-100 transition-colors"
+            onClick={() => setSettingsOpen(true)}
+          >
+            <svg className="w-5 h-5 flex-shrink-0 text-orange-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+            </svg>
+            <span>
+              <strong>API Key não configurada.</strong> Clique aqui para configurar sua Google Cloud Vision API Key antes de processar.
+            </span>
+          </div>
+        )}
+
         {/* Upload zone */}
         <section>
           <UploadZone onFiles={handleFiles} disabled={isProcessing} />
         </section>
 
-        {/* Action bar */}
-        {pendingCount > 0 && (
+        {/* Status bar while processing */}
+        {isProcessing && (
+          <div className="flex items-center gap-3 text-sm text-gray-600">
+            <svg className="w-4 h-4 animate-spin text-blue-600" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+            </svg>
+            <span>
+              Processando com Google Cloud Vision...
+              {estimatedTimeLeft && (
+                <span className="ml-2 text-gray-400">{estimatedTimeLeft}</span>
+              )}
+            </span>
+          </div>
+        )}
+
+        {/* Manual trigger (shown only if there are pending files and not auto-started) */}
+        {pendingCount > 0 && !isProcessing && (
           <div className="flex items-center gap-4 flex-wrap">
             <button
               onClick={processAll}
               disabled={isProcessing}
               className="inline-flex items-center gap-2 px-6 py-2.5 bg-blue-600 text-white rounded-lg font-semibold text-sm hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed transition-all shadow-sm"
             >
-              {isProcessing ? (
-                <>
-                  <svg
-                    className="w-4 h-4 animate-spin"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                  >
-                    <circle
-                      className="opacity-25"
-                      cx="12"
-                      cy="12"
-                      r="10"
-                      stroke="currentColor"
-                      strokeWidth="4"
-                    />
-                    <path
-                      className="opacity-75"
-                      fill="currentColor"
-                      d="M4 12a8 8 0 018-8v8H4z"
-                    />
-                  </svg>
-                  Processando...
-                </>
-              ) : (
-                <>
-                  <svg
-                    className="w-4 h-4"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M13 10V3L4 14h7v7l9-11h-7z"
-                    />
-                  </svg>
-                  Processar {pendingCount} arquivo{pendingCount !== 1 ? "s" : ""}
-                </>
-              )}
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+              </svg>
+              Processar {pendingCount} arquivo{pendingCount !== 1 ? "s" : ""}
             </button>
 
             {hasStarted && doneCount > 0 && (
@@ -270,13 +358,15 @@ export default function Home() {
         {hasStarted && records.length === 0 && !isProcessing && (
           <div className="text-center py-12 text-gray-400">
             <p className="text-lg">Nenhum dado extraído.</p>
-            <p className="text-sm mt-1">Tente enviar arquivos com melhor qualidade de scan.</p>
+            <p className="text-sm mt-1">
+              Verifique se a API Key está correta e tente novamente.
+            </p>
           </div>
         )}
       </main>
 
       <footer className="border-t border-gray-200 py-4 text-center text-xs text-gray-400">
-        Todo o processamento ocorre no seu navegador — nenhum dado é enviado a servidores externos.
+        OCR via Google Cloud Vision API — dados processados no servidor sem persistência
       </footer>
     </div>
   );

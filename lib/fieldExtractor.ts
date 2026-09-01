@@ -1,6 +1,6 @@
 import { MedicalRecord } from "@/types";
 
-// Simple UUID fallback since we don't want to add the uuid package
+// Simple UUID fallback
 function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
@@ -9,12 +9,10 @@ function generateId(): string {
 // Helper utilities
 // ---------------------------------------------------------------------------
 
-/** Normalize text: collapse whitespace, trim */
 function normalize(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
-/** Extract lines from raw OCR text */
 function lines(text: string): string[] {
   return text
     .split(/\r?\n/)
@@ -22,20 +20,21 @@ function lines(text: string): string[] {
     .filter((l) => l.length > 0);
 }
 
-/** Case-insensitive match */
 function icontains(haystack: string, needle: string): boolean {
   return haystack.toLowerCase().includes(needle.toLowerCase());
 }
 
 // ---------------------------------------------------------------------------
-// Field extractors
+// Field extractors — improved for Brazilian medical documents
 // ---------------------------------------------------------------------------
 
 function extractTipo(text: string): string {
   const lower = text.toLowerCase();
   if (
     lower.includes("declaração de comparecimento") ||
-    lower.includes("declaracao de comparecimento")
+    lower.includes("declaracao de comparecimento") ||
+    lower.includes("declaração de presença") ||
+    lower.includes("declaracao de presenca")
   ) {
     return "Declaração de Comparecimento";
   }
@@ -45,7 +44,8 @@ function extractTipo(text: string): string {
   if (
     lower.includes("atestado médico") ||
     lower.includes("atestado medico") ||
-    lower.includes("atesto que")
+    lower.includes("atesto que") ||
+    lower.includes("atesto, para")
   ) {
     return "Atestado";
   }
@@ -64,55 +64,82 @@ function extractTipo(text: string): string {
 function extractNome(text: string): string {
   const ls = lines(text);
 
-  // Trigger keywords followed by the name on the same or next line
-  const triggers = [
-    /(?:paciente|nome do paciente|nome[:\s]+)[:]\s*(.+)/i,
-    /(?:atesto que o[/\s]a?\s+(?:paciente|sr\.?|sra\.?)\s+)(.+?)(?:\s+(?:necessita|esteve|compareceu|encontra|encontrava))/i,
-    /(?:declaro que o[/\s]a?\s+(?:paciente|sr\.?|sra\.?)\s+)(.+?)(?:\s+(?:necessita|esteve|compareceu|encontra))/i,
-  ];
-
-  for (const re of triggers) {
-    const m = text.match(re);
+  // 1. Direct label "Nome:" or "Paciente:" on the same line
+  for (const line of ls) {
+    const m = line.match(/^(?:nome|paciente)\s*[:\-]\s*(.+)$/i);
     if (m && m[1]) {
-      const candidate = normalize(m[1]).replace(/[,;.].*$/, "").trim();
-      if (candidate.length > 2 && candidate.length < 80) {
+      const candidate = normalize(m[1])
+        .replace(/[,;.].*$/, "")
+        .replace(/\b(cpf|rg|data|nasc|sexo|idade)\b.*/i, "")
+        .trim();
+      if (candidate.length > 3 && candidate.length < 80) {
         return toTitleCase(candidate);
       }
     }
   }
 
-  // Fallback: look for a line labeled "Nome:" or "Paciente:"
-  for (const line of ls) {
-    const m = line.match(/^(?:nome|paciente)\s*[:\-]\s*(.+)$/i);
+  // 2. Inline trigger — "atesto que o paciente / o sr. / a sra." + name + verb
+  const inlineTriggers = [
+    /(?:atesto\s+que\s+o[s]?\s*[\/]?\s*a?\s*(?:paciente|sr\.?|sra\.?|senhor|senhora)\s+)([\wÀ-ÖØ-öø-ÿ]+(?:\s+[\wÀ-ÖØ-öø-ÿ]+){1,5})(?:\s*[,;]|\s+(?:encontra|esteve|necessita|compareceu|foi|porta|sob|est[aá]))/i,
+    /(?:declaro\s+que\s+o[s]?\s*[\/]?\s*a?\s*(?:paciente|sr\.?|sra\.?)\s+)([\wÀ-ÖØ-öø-ÿ]+(?:\s+[\wÀ-ÖØ-öø-ÿ]+){1,5})(?:\s*[,;]|\s+(?:encontra|esteve|necessita|compareceu|foi|est[aá]))/i,
+    /(?:paciente[:\s]+)([\wÀ-ÖØ-öø-ÿ]+(?:\s+[\wÀ-ÖØ-öø-ÿ]+){1,5})(?:\s*[,;]|\s+(?:encontra|esteve|necessita|compareceu|foi|est[aá]|com\b|sob\b|\())/i,
+  ];
+
+  for (const re of inlineTriggers) {
+    const m = text.match(re);
     if (m && m[1]) {
-      return toTitleCase(m[1].trim());
+      const candidate = normalize(m[1]).trim();
+      if (candidate.length > 3 && candidate.length < 80) {
+        return toTitleCase(candidate);
+      }
     }
   }
+
+  // 3. Look for capitalized multi-word sequences after known triggers in line context
+  for (const line of ls) {
+    if (
+      /^(?:nome|paciente|sr\.?|sra\.?)\s*/i.test(line) ||
+      /(?:paciente|nome do paciente)\s*[:]/i.test(line)
+    ) {
+      const afterColon = line.replace(/^[^:]+:\s*/, "").trim();
+      if (afterColon.length > 3 && afterColon.length < 80) {
+        return toTitleCase(afterColon.replace(/[,;].*$/, "").trim());
+      }
+    }
+  }
+
+  // 4. Fallback: find the first line with multiple capitalized words (a name-like pattern)
+  // near keywords like "paciente", "nome", etc.
+  const nameBlock = text.match(
+    /(?:paciente|nome)[^\n]*\n\s*((?:[A-ZÀ-Ú][a-zà-ú]+\s+){2,5}[A-ZÀ-Ú][a-zà-ú]+)/m
+  );
+  if (nameBlock) return toTitleCase(normalize(nameBlock[1]));
 
   return "";
 }
 
 function extractData(text: string): string {
-  // Look for date patterns DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY
+  // Priority: look near date keywords first
+  const keywordContexts = [
+    /(?:data\s+(?:do\s+)?atendimento|data\s+da\s+consulta|data\s+emiss[aã]o)[:\s]+(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i,
+    /(?:data|atendimento|consulta|emiss[aã]o|comparecimento)[:\s]+(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i,
+    /\b(?:em|dia|date)[:\s]+(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})\b/i,
+  ];
+
+  for (const re of keywordContexts) {
+    const m = text.match(re);
+    if (m) return normalizeDate(m[1]);
+  }
+
+  // Bare date patterns — take the first match
   const datePatterns = [
     /\b(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})\b/g,
     /\b(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2})\b/g,
   ];
 
-  // Priority: look near keywords first
-  const keywordContext = text.match(
-    /(?:data|atendimento|consulta|emiss[aã]o)[:\s]+(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i
-  );
-  if (keywordContext) {
-    return normalizeDate(keywordContext[1]);
-  }
-
   for (const pattern of datePatterns) {
     const matches = Array.from(text.matchAll(pattern));
-    if (matches.length > 0) {
-      // Take the first date found
-      return normalizeDate(matches[0][0]);
-    }
+    if (matches.length > 0) return normalizeDate(matches[0][0]);
   }
 
   return "";
@@ -127,22 +154,39 @@ function normalizeDate(raw: string): string {
 }
 
 function extractPeriodo(text: string): string {
+  const lower = text.toLowerCase();
+
+  // Declaração de comparecimento → "Comparecimento"
+  if (
+    lower.includes("declaração de comparecimento") ||
+    lower.includes("declaracao de comparecimento") ||
+    lower.includes("comparecimento")
+  ) {
+    // Check if this is purely a comparecimento without days mentioned
+    const hasDays = /\d+\s*dias?/i.test(text);
+    if (!hasDays) return "Comparecimento";
+  }
+
   const patterns = [
-    /(\d+)\s*(?:dias?|day)/i,
-    /per[íi]odo\s+de\s+(\d+)\s*dias?/i,
-    /repouso\s+(?:de\s+)?(\d+)\s*dias?/i,
-    /afastamento\s+(?:de\s+)?(\d+)\s*dias?/i,
-    /licen[çc]a\s+(?:de\s+)?(\d+)\s*dias?/i,
+    // "repouso de 3 dias", "afastamento de 2 dias", "licença de 5 dias"
+    /(?:repouso|afastamento|licen[çc]a|per[íi]odo)\s+(?:de\s+)?(\d+)\s*(?:dias?|day)/i,
+    // "por X dia(s)"
+    /por\s+(\d+)\s*(?:dias?|day)/i,
+    // "X dias de repouso"
+    /(\d+)\s*dias?\s+(?:de\s+)?(?:repouso|afastamento|licen[çc]a)/i,
+    // standalone "3 dias" or "1 dia"
+    /\b(\d+)\s*(?:dias?)\b/i,
   ];
 
   for (const re of patterns) {
     const m = text.match(re);
     if (m) {
-      return `${m[1]} dia(s)`;
+      const n = parseInt(m[1], 10);
+      return `${n} dia${n !== 1 ? "s" : ""}`;
     }
   }
 
-  // Check for "período" without explicit days
+  // Período without explicit days
   const periodMatch = text.match(/per[íi]odo[:\s]+([^\n,;.]{1,40})/i);
   if (periodMatch) return normalize(periodMatch[1]);
 
@@ -150,10 +194,25 @@ function extractPeriodo(text: string): string {
 }
 
 function extractHorario(text: string): string {
-  // Context-aware: prefer near "horário", "hora", "às"
+  // Time range patterns like "09:30 às 10:09" or "05:00 as 12:00"
+  const rangePatterns = [
+    /(\d{1,2}[h:]\d{2})\s*[àa]s?\s*(\d{1,2}[h:]\d{2})/i,
+    /(\d{1,2}h\d{2})\s*[àa]s?\s*(\d{1,2}h\d{2})/i,
+  ];
+
+  for (const re of rangePatterns) {
+    const m = text.match(re);
+    if (m) {
+      const from = m[1].replace(":", "h");
+      const to = m[2].replace(":", "h");
+      return `${from} às ${to}`;
+    }
+  }
+
+  // Context-aware single time
   const contextPatterns = [
-    /(?:hor[áa]rio|hora|[aà]s)[:\s]+(\d{1,2}[h:]\d{2})/i,
-    /(?:hor[áa]rio|hora|[aà]s)[:\s]+(\d{1,2}h)/i,
+    /(?:hor[áa]rio|hora(?:rio)?)[:\s]+(\d{1,2}[h:]\d{2})/i,
+    /(?:entrada|sa[íi]da|in[íi]cio|t[eé]rmino)[:\s]+(\d{1,2}[h:]\d{2})/i,
   ];
 
   for (const re of contextPatterns) {
@@ -181,17 +240,24 @@ function extractHorario(text: string): string {
 }
 
 function extractCid(text: string): string {
-  // ICD-10 format: Letter + 2 digits + optional dot + optional 1-2 digits
-  const cidPattern = /\b([A-Z]\d{2}(?:\.\d{1,2})?)\b/g;
-
-  // Context-aware first
+  // Context-aware first: "CID:" or "CID-10:"
   const contextMatch = text.match(
     /CID(?:-10)?[:\s]*([A-Z]\d{2}(?:\.\d{1,2})?)/i
   );
   if (contextMatch) return contextMatch[1].toUpperCase();
 
+  // Standalone ICD-10 codes (Letter + 2 digits + optional .X or .XX)
+  const cidPattern = /\b([A-Z]\d{2}(?:\.\d{1,2})?)\b/g;
   const matches = Array.from(text.matchAll(cidPattern));
-  if (matches.length > 0) return matches[0][1].toUpperCase();
+
+  // Filter out common false positives that look like ICD codes
+  const filtered = matches.filter((m) => {
+    const code = m[1];
+    // Skip things like "A4" (too short), "Z99" common known non-codes
+    return code.length >= 3;
+  });
+
+  if (filtered.length > 0) return filtered[0][1].toUpperCase();
 
   return "Não informado";
 }
@@ -199,13 +265,16 @@ function extractCid(text: string): string {
 function extractLocal(text: string): string {
   const ls = lines(text);
 
-  // Direct label match
+  // Direct label match on the same line
   for (const line of ls) {
-    const m = line.match(/^(?:local|estabelecimento|unidade|hospital|cl[íi]nica|UBS|UPA)[:\s]+(.+)$/i);
+    const m = line.match(
+      /^(?:local(?:\s+de\s+atendimento)?|estabelecimento|unidade|hospital|cl[íi]nica)[:\s]+(.+)$/i
+    );
     if (m && m[1]) return normalize(m[1]);
   }
 
-  // Keyword proximity: find lines containing hospital/clínica keywords
+  // Known hospital/clinic keyword-bearing lines
+  // UPA, PS Central, Hospital Geral, UMS, etc.
   const locationKeywords = [
     "hospital",
     "clínica",
@@ -214,17 +283,25 @@ function extractLocal(text: string): string {
     "upa",
     "pronto-socorro",
     "pronto socorro",
+    "ps central",
     "centro médico",
     "centro medico",
     "unidade de saúde",
+    "unidade mista",
+    "ums",
     "posto de saúde",
     "ambulatório",
     "ambulatorio",
+    "hgr",
+    "santa casa",
+    "beneficência",
+    "beneficencia",
   ];
 
   for (const line of ls) {
+    const lower = line.toLowerCase();
     for (const kw of locationKeywords) {
-      if (icontains(line, kw) && line.length < 100) {
+      if (lower.includes(kw) && line.length < 120) {
         return normalize(line);
       }
     }
@@ -236,23 +313,23 @@ function extractLocal(text: string): string {
 function extractProfissional(text: string): string {
   const ls = lines(text);
 
-  // Direct label match
+  // Direct label
   for (const line of ls) {
     const m = line.match(
-      /^(?:m[eé]dico|profissional|respons[aá]vel|doutor|dr\.?|dra\.?)[:\s]+(.+)$/i
+      /^(?:m[eé]dico(?:\s+respons[aá]vel)?|profissional(?:\s+respons[aá]vel)?|respons[aá]vel|doutor|dra?\.)[:\s]+(.+)$/i
     );
     if (m && m[1]) return normalize(m[1]);
   }
 
-  // CRM/CRO proximity pattern
-  const crmMatch = text.match(
-    /(?:Dr\.?|Dra\.?)\s+([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+){1,4})/
+  // CRM/CRO proximity
+  const crmContextMatch = text.match(
+    /(?:Dr\.?|Dra\.?)\s+([\wÀ-ÖØ-öø-ÿ]+(?:\s+[\wÀ-ÖØ-öø-ÿ]+){1,4})/
   );
-  if (crmMatch) return normalize(crmMatch[0]);
+  if (crmContextMatch) return normalize(crmContextMatch[0]);
 
-  // Line ending with CRM number
+  // Line containing CRM/CRO number
   for (const line of ls) {
-    if (/CRM[:\s]*\d+/i.test(line) && line.length < 120) {
+    if (/CR[MO][:\s]*\d+/i.test(line) && line.length < 120) {
       return normalize(line);
     }
   }
@@ -262,14 +339,24 @@ function extractProfissional(text: string): string {
 
 function extractObservacao(text: string): string {
   const obsTriggers = [
-    /(?:obs(?:erva[çc][aã]o)?|recomenda[çc][oõ]es?|orienta[çc][oõ]es?)[:\s]+(.+?)(?:\n|$)/is,
-    /(?:prescrições?|prescricoes?)[:\s]+(.+?)(?:\n|$)/is,
+    // "Obs:", "Observação:", "Observações:"
+    /(?:obs(?:erva[çc][aã]o)?s?)[:\s]+(.+?)(?:\n|$)/i,
+    // Specific procedure types used in Brazilian medical docs
+    /\b(acompanhando\s+(?:filho|esposo|esposa|familiar|paciente)[^\n]*)/i,
+    /\b(exame\s+toxicol[oó]gico[^\n]*)/i,
+    /\b(exame[^\n]{0,50})/i,
+    /\b(repous(?:ar|o)[^\n]{0,50})/i,
+    /\b(consulta\s+m[eé]dica[^\n]*)/i,
+    /\b(atendimento\s+odontol[oó]gico[^\n]*)/i,
+    /\b(acompanhando[^\n]*)/i,
+    // Generic recommendations
+    /(?:recomenda[çc][oõ]es?|orienta[çc][oõ]es?|prescri[çc][oõ]es?)[:\s]+(.+?)(?:\n|$)/i,
   ];
 
   for (const re of obsTriggers) {
     const m = text.match(re);
-    if (m && m[1]) {
-      const obs = normalize(m[1]);
+    if (m) {
+      const obs = normalize(m[1] || m[0]);
       if (obs.length > 2 && obs.length < 300) return obs;
     }
   }
@@ -282,7 +369,7 @@ function extractObservacao(text: string): string {
 // ---------------------------------------------------------------------------
 
 function toTitleCase(str: string): string {
-  const lower = ["de", "da", "do", "das", "dos", "e", "a", "o", "em", "na", "no"];
+  const lower = ["de", "da", "do", "das", "dos", "e", "a", "o", "em", "na", "no", "dos", "das"];
   return str
     .toLowerCase()
     .split(" ")
