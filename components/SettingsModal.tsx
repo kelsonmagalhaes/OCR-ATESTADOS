@@ -63,12 +63,12 @@ export default function SettingsModal({
 
         {/* Info */}
         <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-sm text-blue-800 space-y-1">
-          <p className="font-semibold">Google Cloud Vision API Key</p>
+          <p className="font-semibold">Google API Key — Gemini</p>
           <p>
             A chave é armazenada apenas no navegador (localStorage). Para uso em
             produção, defina a variável de ambiente{" "}
             <code className="bg-blue-100 px-1 rounded font-mono text-xs">
-              GOOGLE_CLOUD_VISION_API_KEY
+              GOOGLE_API_KEY
             </code>{" "}
             no Vercel.
           </p>

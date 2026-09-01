@@ -8,9 +8,9 @@ import DataTable from "@/components/DataTable";
 import ExportButton from "@/components/ExportButton";
 import SettingsModal, { STORAGE_KEY } from "@/components/SettingsModal";
 import { MedicalRecord, FileQueueItem, RecordField } from "@/types";
-import { extractFields } from "@/lib/fieldExtractor";
 
-const BATCH_SIZE = 5; // pages processed in parallel per file
+const BATCH_SIZE = 3; // pages processed in parallel per batch
+const BATCH_DELAY_MS = 1000; // 1s delay between batches to respect rate limits
 
 function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
@@ -24,13 +24,17 @@ function emptyRecord(): MedicalRecord {
     dataAtendimento: "",
     periodoDias: "",
     horario: "",
-    cid: "Não informado",
+    cid: "Nao informado",
     local: "",
     profissional: "",
     observacao: "",
     arquivo: "",
     status: "done",
   };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export default function Home() {
@@ -86,7 +90,7 @@ export default function Home() {
   queueRef.current = queue;
 
   // -----------------------------------------------------------------------
-  // OCR processing with parallel page batches
+  // OCR processing: each PDF page = one certificate, batches of 3, 1s delay
   // -----------------------------------------------------------------------
 
   const processAll = useCallback(async () => {
@@ -104,9 +108,10 @@ export default function Home() {
     setHasStarted(true);
     processingStartRef.current = Date.now();
     pagesProcessedRef.current = 0;
+    totalPagesRef.current = 0;
 
     const { pdfToImages } = await import("@/lib/pdfToImages");
-    const { recognizeImage } = await import("@/lib/ocrEngine");
+    const { recognizeImage, fieldsToRecord } = await import("@/lib/ocrEngine");
 
     for (const item of pending) {
       setQueue((prev) =>
@@ -148,10 +153,16 @@ export default function Home() {
           )
         );
 
-        // Process pages in parallel batches
-        const pageTexts: string[] = new Array(images.length).fill("");
+        // Process pages in batches of BATCH_SIZE with delay between batches
+        // Each page is one certificate — collect non-blank results
+        const pageRecords: MedicalRecord[] = [];
 
         for (let batchStart = 0; batchStart < images.length; batchStart += BATCH_SIZE) {
+          // Add delay between batches (not before the first one)
+          if (batchStart > 0) {
+            await sleep(BATCH_DELAY_MS);
+          }
+
           const batchEnd = Math.min(batchStart + BATCH_SIZE, images.length);
           const batch = images.slice(batchStart, batchEnd);
 
@@ -172,7 +183,11 @@ export default function Home() {
           );
 
           for (let i = 0; i < batchResults.length; i++) {
-            pageTexts[batchStart + i] = batchResults[i].text;
+            const result = batchResults[i];
+            // Skip blank pages
+            if (result.isBlank) continue;
+            const record = fieldsToRecord(result.fields, item.file.name);
+            pageRecords.push(record);
           }
 
           pagesProcessedRef.current += batch.length;
@@ -193,10 +208,11 @@ export default function Home() {
           }
         }
 
-        const fullText = pageTexts.join("\n");
-        const record = extractFields(fullText, item.file.name);
+        // Add all records from this file
+        if (pageRecords.length > 0) {
+          setRecords((prev) => [...prev, ...pageRecords]);
+        }
 
-        setRecords((prev) => [...prev, record]);
         setQueue((prev) =>
           prev.map((q) =>
             q.id === item.id ? { ...q, status: "done", progress: 100 } : q
@@ -288,7 +304,7 @@ export default function Home() {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
             </svg>
             <span>
-              <strong>API Key não configurada.</strong> Clique aqui para configurar sua Google Cloud Vision API Key antes de processar.
+              <strong>API Key não configurada.</strong> Clique aqui para configurar sua Google API Key (Gemini) antes de processar.
             </span>
           </div>
         )}
@@ -306,7 +322,7 @@ export default function Home() {
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
             </svg>
             <span>
-              Processando com Google Cloud Vision...
+              Processando com Google Gemini 1.5 Flash...
               {estimatedTimeLeft && (
                 <span className="ml-2 text-gray-400">{estimatedTimeLeft}</span>
               )}
@@ -366,7 +382,7 @@ export default function Home() {
       </main>
 
       <footer className="border-t border-gray-200 py-4 text-center text-xs text-gray-400">
-        OCR via Google Cloud Vision API — dados processados no servidor sem persistência
+        OCR via Google Gemini 1.5 Flash — dados processados no servidor sem persistência
       </footer>
     </div>
   );
