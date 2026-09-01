@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --foreground: #111827;
+  --background: #f9fafb;
+}
+
+html {
+  background-color: var(--background);
+  color: var(--foreground);
+}
+
+/* Smooth scrolling */
+* {
+  scroll-behavior: smooth;
+}
+
+/* Table cell inputs look native */
+table input[type="text"] {
+  font-size: 0.8125rem;
+}
