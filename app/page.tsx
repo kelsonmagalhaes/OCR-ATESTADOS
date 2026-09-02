@@ -322,7 +322,7 @@ export default function Home() {
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
             </svg>
             <span>
-              Processando com Google Gemini 1.5 Flash...
+              Processando com Google Gemini...
               {estimatedTimeLeft && (
                 <span className="ml-2 text-gray-400">{estimatedTimeLeft}</span>
               )}
@@ -382,7 +382,7 @@ export default function Home() {
       </main>
 
       <footer className="border-t border-gray-200 py-4 text-center text-xs text-gray-400">
-        OCR via Google Gemini 1.5 Flash — dados processados no servidor sem persistência
+        OCR via Google Gemini — dados processados no servidor sem persistência
       </footer>
     </div>
   );
