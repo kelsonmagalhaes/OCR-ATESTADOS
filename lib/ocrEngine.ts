@@ -25,12 +25,16 @@ export interface OcrResult {
   isBlank: boolean;
 }
 
+const MAX_RETRIES = 3;
+const RETRY_DELAYS = [10000, 20000, 40000]; // 10s, 20s, 40s
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
- * Calls the /api/ocr serverless route which uses Google Gemini 1.5 Flash.
- * Returns structured JSON fields extracted directly by Gemini.
- * @param imageSource - data URL (base64) of the page image
- * @param apiKey - user-supplied API key (used if env var not set on server)
- * @param onProgress - optional progress callback 0-100
+ * Calls the /api/ocr serverless route which uses Google Gemini.
+ * Includes automatic retry with backoff on 429 (quota exceeded) errors.
  */
 export async function recognizeImage(
   imageSource: string,
@@ -39,38 +43,71 @@ export async function recognizeImage(
 ): Promise<OcrResult> {
   if (onProgress) onProgress(10);
 
-  const res = await fetch("/api/ocr", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ image: imageSource, apiKey }),
-  });
+  let lastError: Error | null = null;
 
-  if (onProgress) onProgress(90);
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    // Wait before retry (not on first attempt)
+    if (attempt > 0) {
+      const delay = RETRY_DELAYS[attempt - 1] || 40000;
+      if (onProgress) onProgress(10); // reset progress during retry
+      await sleep(delay);
+    }
 
-  if (!res.ok) {
-    const errData = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(errData.error || `OCR request failed: ${res.status}`);
+    try {
+      const res = await fetch("/api/ocr", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image: imageSource, apiKey }),
+      });
+
+      if (onProgress) onProgress(90);
+
+      // Rate limited — retry
+      if (res.status === 429) {
+        const errData = await res.json().catch(() => ({}));
+        lastError = new Error(errData.error || "Rate limited (429)");
+        continue; // retry
+      }
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({ error: res.statusText }));
+        throw new Error(errData.error || `OCR request failed: ${res.status}`);
+      }
+
+      const data = await res.json();
+
+      if (data.error) {
+        // If Gemini returned 429 through our route
+        if (data.error.includes("429") || data.error.includes("quota")) {
+          lastError = new Error(data.error);
+          continue; // retry
+        }
+        throw new Error(data.error);
+      }
+
+      if (onProgress) onProgress(100);
+
+      const fields = data.fields as GeminiFields | null;
+      const rawText = data.rawText || "";
+      const isBlank = !!(fields && fields.blank === true);
+
+      return {
+        fields: isBlank ? null : fields,
+        rawText,
+        isBlank,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("429") || msg.includes("quota")) {
+        lastError = err instanceof Error ? err : new Error(msg);
+        continue; // retry
+      }
+      throw err; // non-retryable error
+    }
   }
 
-  const data = await res.json();
-
-  if (data.error) {
-    throw new Error(data.error);
-  }
-
-  if (onProgress) onProgress(100);
-
-  const fields = data.fields as GeminiFields | null;
-  const rawText = data.rawText || "";
-
-  // Check if Gemini flagged the page as blank
-  const isBlank = !!(fields && fields.blank === true);
-
-  return {
-    fields: isBlank ? null : fields,
-    rawText,
-    isBlank,
-  };
+  // All retries exhausted
+  throw lastError || new Error("OCR failed after retries");
 }
 
 /**
@@ -87,7 +124,7 @@ export function fieldsToRecord(
     dataAtendimento: fields?.dataAtendimento || "",
     periodoDias: fields?.periodoDias || "",
     horario: fields?.horario || "",
-    cid: fields?.cid || "Nao informado",
+    cid: fields?.cid || "Não informado",
     local: fields?.local || "",
     profissional: fields?.profissional || "",
     observacao: fields?.observacao || "",

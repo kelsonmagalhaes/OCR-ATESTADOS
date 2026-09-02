@@ -9,8 +9,8 @@ import ExportButton from "@/components/ExportButton";
 import SettingsModal, { STORAGE_KEY } from "@/components/SettingsModal";
 import { MedicalRecord, FileQueueItem, RecordField } from "@/types";
 
-const BATCH_SIZE = 3; // pages processed in parallel per batch
-const BATCH_DELAY_MS = 1000; // 1s delay between batches to respect rate limits
+const BATCH_SIZE = 1; // one page at a time to respect free tier rate limits
+const BATCH_DELAY_MS = 4500; // 4.5s delay between requests (max ~13/min, under 15 RPM limit)
 
 function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
